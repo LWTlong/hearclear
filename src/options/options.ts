@@ -1,4 +1,5 @@
-export {}
+import { getCachedProfile, getPreferredProfile, getProfileLabel, hasModelFiles, normalizeModelId } from '../shared/asr'
+import type { AsrConfig } from '../shared/types'
 
 // ── Elements ──
 
@@ -32,6 +33,7 @@ const MODELS = [
   { id: 'onnx-community/whisper-tiny', key: 'tiny' },
   { id: 'onnx-community/whisper-small', key: 'small' },
   { id: 'onnx-community/whisper-base', key: 'base' },
+  { id: 'onnx-community/whisper-medium-ONNX', key: 'medium' },
 ]
 
 // ── Load saved config ──
@@ -48,8 +50,10 @@ chrome.storage.local.get(['translationConfig', 'asrConfig', 'subtitleStyle'], (d
   const a = data.asrConfig
   if (a) {
     asrDevice.value = a.device ?? 'webgpu'
-    const radio = document.querySelector(`input[name="asr-model"][value="${a.modelId}"]`) as HTMLInputElement | null
+    const modelId = normalizeModelId(a.modelId)
+    const radio = document.querySelector(`input[name="asr-model"][value="${modelId}"]`) as HTMLInputElement | null
     if (radio) radio.checked = true
+    if (modelId !== a.modelId) chrome.storage.local.set({ asrConfig: { ...a, modelId } })
   }
   const s = data.subtitleStyle
   if (s) {
@@ -58,6 +62,7 @@ chrome.storage.local.get(['translationConfig', 'asrConfig', 'subtitleStyle'], (d
     styleBgOpacity.value = String(Math.round((s.backgroundOpacity ?? 0.7) * 100))
     updateStylePreview()
   }
+  checkModelCache()
 })
 
 // ── Translation test (request host permission first) ──
@@ -120,30 +125,36 @@ async function checkModelCache() {
     const cache = await caches.open('transformers-cache')
     const keys = await cache.keys()
     const urls = keys.map(r => r.url)
+    const device = asrDevice.value as AsrConfig['device']
+    const preferredProfile = getPreferredProfile(device)
+    const profileLabel = getProfileLabel(preferredProfile)
 
     let totalSize = 0
     for (const model of MODELS) {
       const el = document.getElementById(`status-${model.key}`)!
-      const matched = urls.filter(u => u.includes(model.id))
-      if (matched.length > 0) {
-        el.textContent = '已下载'
+      const matched = urls.filter(url => new URL(url).pathname.startsWith(`/${model.id}/resolve/`))
+      if (hasModelFiles(urls, model.id, preferredProfile)) {
+        el.textContent = `${profileLabel} 已下载`
         el.className = 'status status-cached'
-        for (const url of matched) {
-          const resp = await cache.match(url)
-          if (resp) {
-            const blob = await resp.blob()
-            totalSize += blob.size
-          }
-        }
+      } else if (device === 'webgpu' && hasModelFiles(urls, model.id, 'q8')) {
+        el.textContent = 'Q8 已下载（WASM 兼容模式）'
+        el.className = 'status status-cached'
       } else {
-        el.textContent = '未下载'
+        el.textContent = `${profileLabel} 未完整缓存`
         el.className = 'status status-none'
+      }
+      for (const url of matched) {
+        const resp = await cache.match(url)
+        if (resp) {
+          const blob = await resp.blob()
+          totalSize += blob.size
+        }
       }
     }
 
     diagCache.textContent = totalSize > 0
-      ? `已缓存 ${(totalSize / 1024 / 1024).toFixed(0)} MB`
-      : '无缓存'
+      ? `共缓存 ${(totalSize / 1024 / 1024).toFixed(0)} MB（含其他格式）；优先 ${device.toUpperCase()} / ${profileLabel}`
+      : `无缓存；优先 ${device.toUpperCase()} / ${profileLabel}`
   } catch {
     for (const model of MODELS) {
       const el = document.getElementById(`status-${model.key}`)!
@@ -154,11 +165,12 @@ async function checkModelCache() {
   }
 }
 
-checkModelCache()
+asrDevice.addEventListener('change', checkModelCache)
 
 // ── Model download (trigger via service worker → offscreen) ──
 
 let downloading = false
+let pendingDownload: { requestId: string; modelId: string; device: AsrConfig['device'] } | null = null
 let totalBytesMap = new Map<string, { loaded: number; total: number }>()
 
 function computeTotalProgress(): number {
@@ -174,6 +186,11 @@ btnDownload.addEventListener('click', () => {
 
   const selectedModel = (document.querySelector('input[name="asr-model"]:checked') as HTMLInputElement)?.value
     ?? 'onnx-community/whisper-small'
+  pendingDownload = {
+    requestId: crypto.randomUUID(),
+    modelId: selectedModel,
+    device: asrDevice.value as AsrConfig['device'],
+  }
 
   btnDownload.disabled = true
   btnDownload.textContent = '下载中...'
@@ -182,12 +199,26 @@ btnDownload.addEventListener('click', () => {
 
   chrome.runtime.sendMessage({
     type: 'model:download',
-    data: { modelId: selectedModel, device: asrDevice.value },
+    data: pendingDownload,
+  }).catch(err => {
+    downloading = false
+    pendingDownload = null
+    btnDownload.disabled = false
+    btnDownload.textContent = '下载选中模型'
+    modelResult.textContent = `下载失败: ${err.message}`
+    modelResult.className = 'result-box fail'
   })
 })
 
 chrome.runtime.onMessage.addListener((msg: any) => {
   if (msg.type === 'model:progress') {
+    if (!downloading) return
+    if (!msg.data.file) {
+      totalBytesMap.clear()
+      modelResult.textContent = msg.data.status ?? '正在加载模型...'
+      modelResult.className = 'result-box info'
+      return
+    }
     const file: string = msg.data.file ?? msg.data.status ?? ''
     const loaded = msg.data.loaded ?? 0
     const total = msg.data.total ?? 0
@@ -198,36 +229,44 @@ chrome.runtime.onMessage.addListener((msg: any) => {
     const pct = computeTotalProgress()
     const shortFile = file.split('/').pop() ?? ''
 
-    modelResult.textContent = `下载中: ${shortFile} — 总进度 ${pct}%`
+    modelResult.textContent = `${msg.data.status ?? `加载中: ${shortFile}`} — 总进度 ${pct}%`
     modelResult.className = 'result-box info'
-    btnDownload.textContent = `下载中 ${pct}%`
+    if (downloading) btnDownload.textContent = `下载/加载中 ${pct}%`
 
-    // Update the specific model status
-    for (const model of MODELS) {
-      if (file.includes(model.id)) {
-        const el = document.getElementById(`status-${model.key}`)!
-        el.textContent = `${pct}%`
-        el.className = 'status status-loading'
-      }
+    const model = MODELS.find(item => item.id === pendingDownload?.modelId)
+    if (model) {
+      const el = document.getElementById(`status-${model.key}`)!
+      el.textContent = `${pct}%`
+      el.className = 'status status-loading'
     }
   }
 
   if (msg.type === 'model:ready') {
+    const pending = pendingDownload
+    const matchesDownload = downloading && pending
+      && pending.requestId === msg.data.requestId
+      && pending.modelId === msg.data.modelId
+      && pending.device === msg.data.device
+      && msg.data.profile === getPreferredProfile(pending.device)
+    if (!matchesDownload) return
+    modelResult.textContent = `模型 ${msg.data.modelId} / ${msg.data.profileLabel} 下载完成`
     downloading = false
+    pendingDownload = null
     totalBytesMap.clear()
     btnDownload.disabled = false
     btnDownload.textContent = '下载选中模型'
-    modelResult.textContent = `模型 ${msg.data.modelId} 下载完成`
     modelResult.className = 'result-box ok'
     checkModelCache()
   }
 
   if (msg.type === 'model:error') {
+    if (!downloading || msg.data.requestId !== pendingDownload?.requestId) return
+    modelResult.textContent = `下载失败: ${msg.data.message}`
     downloading = false
+    pendingDownload = null
     totalBytesMap.clear()
     btnDownload.disabled = false
     btnDownload.textContent = '下载选中模型'
-    modelResult.textContent = `下载失败: ${msg.data.message}`
     modelResult.className = 'result-box fail'
   }
 })
@@ -271,16 +310,17 @@ updateStylePreview()
 
 async function checkWebGPU() {
   if (!('gpu' in navigator)) {
-    diagWebgpu.textContent = '不支持（将使用 WASM）'
+    diagWebgpu.textContent = 'WebGPU 不可用，请手动选择 WASM 并下载对应模型'
     return
   }
   try {
-    const adapter = await (navigator as any).gpu.requestAdapter()
+    const adapter = await (navigator as any).gpu.requestAdapter({ powerPreference: 'high-performance' })
     if (adapter) {
-      const info = await adapter.requestAdapterInfo?.() ?? {}
-      diagWebgpu.textContent = `支持 (${info.description || info.device || 'GPU'})`
+      const info = adapter.info ?? await adapter.requestAdapterInfo?.() ?? {}
+      const name = info.description || [info.vendor, info.architecture].filter(Boolean).join(' ') || 'GPU'
+      diagWebgpu.textContent = `支持 WebGPU (${name})；推荐格式 FP32/Q4，实际推理设备见诊断日志`
     } else {
-      diagWebgpu.textContent = '不支持（将使用 WASM）'
+      diagWebgpu.textContent = 'WebGPU 不可用，请手动选择 WASM 并下载对应模型'
     }
   } catch {
     diagWebgpu.textContent = '检测失败'

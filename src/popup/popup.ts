@@ -1,4 +1,5 @@
-export {}
+import { DEFAULT_ASR_CONFIG, getCachedProfile, getProfileLabel, normalizeModelId } from '../shared/asr'
+import type { AsrConfig, Cue, SubtitleDisplayMode } from '../shared/types'
 
 const btnStart = document.getElementById('btn-start') as HTMLButtonElement
 const statusEl = document.getElementById('status')!
@@ -14,9 +15,48 @@ const modelText = document.getElementById('model-text')!
 const modelProgressWrap = document.getElementById('model-progress-wrap')!
 const modelProgressFill = document.getElementById('model-progress-fill')!
 const modelPct = document.getElementById('model-pct')!
+const captionPanel = document.getElementById('caption-panel')!
+const captionEmpty = document.getElementById('caption-empty')!
 
 let isRunning = false
-let modelReady = false
+let selectedModelId = DEFAULT_ASR_CONFIG.modelId
+let selectedDevice = DEFAULT_ASR_CONFIG.device
+let displayMode: SubtitleDisplayMode = 'bilingual'
+const captions = new Map<string, Cue>()
+
+function renderCaptions() {
+  captionPanel.replaceChildren()
+  const visible = [...captions.values()]
+  if (visible.length === 0) {
+    captionPanel.appendChild(captionEmpty)
+    captionEmpty.textContent = isRunning ? '等待识别结果...' : '识别结果将在这里显示'
+    return
+  }
+  for (const cue of visible) {
+    const item = document.createElement('div')
+    item.className = 'caption-item'
+    if (displayMode !== 'translation' || !cue.translation) {
+      const original = document.createElement('div')
+      original.className = 'caption-original'
+      original.textContent = cue.original
+      item.appendChild(original)
+    }
+    if (displayMode !== 'original' && cue.translation) {
+      const translation = document.createElement('div')
+      translation.className = 'caption-translation'
+      translation.textContent = cue.translation
+      item.appendChild(translation)
+    }
+    captionPanel.appendChild(item)
+  }
+  captionPanel.scrollTop = captionPanel.scrollHeight
+}
+
+function updateCaption(cue: Cue) {
+  captions.set(cue.id, cue)
+  while (captions.size > 50) captions.delete(captions.keys().next().value!)
+  renderCaptions()
+}
 
 // ── Total download progress tracking ──
 let totalBytesMap = new Map<string, { loaded: number; total: number }>()
@@ -47,7 +87,7 @@ function updateUI(state: string, detail?: string) {
     btnStart.textContent = '停止'
     btnStart.className = 'btn btn-stop'
     isRunning = true
-  } else if (state.includes('错误') || state.includes('失败') || state.includes('未检测') || state.includes('未找到')) {
+  } else if (state.includes('错误') || state.includes('失败') || state.includes('出错') || state.includes('未检测') || state.includes('未找到')) {
     statusEl.classList.add('error')
     btnStart.textContent = '重试'
     btnStart.className = 'btn btn-primary'
@@ -57,6 +97,7 @@ function updateUI(state: string, detail?: string) {
     btnStart.className = 'btn btn-primary'
     isRunning = false
   }
+  if (captions.size === 0) renderCaptions()
 }
 
 function updateModelUI(dotClass: string, text: string, progress?: number) {
@@ -81,25 +122,32 @@ chrome.runtime.sendMessage({ type: 'session:query' }, (resp) => {
     workModeEl.value = s.workMode
     srcLangEl.value = s.sourceLang
   }
+  for (const cue of resp?.captions ?? []) updateCaption(cue)
+  if (!resp?.captions?.length) renderCaptions()
 })
 
 // Check if model is cached
 async function checkModelCached() {
   try {
+    const { asrConfig } = await chrome.storage.local.get('asrConfig')
+    selectedModelId = normalizeModelId((asrConfig as AsrConfig | undefined)?.modelId ?? DEFAULT_ASR_CONFIG.modelId)
+    selectedDevice = (asrConfig as AsrConfig | undefined)?.device ?? DEFAULT_ASR_CONFIG.device
     const cache = await caches.open('transformers-cache')
     const keys = await cache.keys()
-    const hasModel = keys.some(r => r.url.includes('whisper'))
-    if (hasModel) {
-      modelReady = true
-      updateModelUI('dot-ok', '模型就绪')
+    const profile = getCachedProfile(keys.map(r => r.url), selectedModelId, selectedDevice)
+    if (profile) {
+      updateModelUI('dot-ok', `${selectedModelId.split('/').pop()} / ${getProfileLabel(profile)} 已缓存（启动时加载）`)
     } else {
-      updateModelUI('dot-none', '模型未下载 — 请先在设置中下载')
+      updateModelUI('dot-none', '所选模型未完整缓存 — 请在设置中下载')
     }
   } catch {
-    updateModelUI('dot-none', '模型未下载')
+    updateModelUI('dot-none', '无法检测模型缓存')
   }
 }
 checkModelCached()
+chrome.storage.onChanged.addListener(changes => {
+  if (changes.asrConfig) checkModelCached()
+})
 
 // ── Controls ──
 btnStart.addEventListener('click', () => {
@@ -110,11 +158,6 @@ btnStart.addEventListener('click', () => {
   }
 
   const mode = workModeEl.value
-  if ((mode === 'asr_only' || mode === 'auto') && !modelReady) {
-    updateUI('模型未下载', '请先在设置页下载 Whisper 模型')
-    return
-  }
-
   chrome.runtime.sendMessage({
     type: 'session:start',
     data: {
@@ -122,7 +165,9 @@ btnStart.addEventListener('click', () => {
       sourceLang: srcLangEl.value,
       targetLang: tgtLangEl.value,
     },
-  })
+  }).then(resp => {
+    if (!resp?.ok) updateUI('启动失败', resp?.error ?? '后台未响应')
+  }).catch(err => updateUI('启动失败', err.message))
   updateUI('检测中...')
 })
 
@@ -148,12 +193,25 @@ btnSidePanel.addEventListener('click', async () => {
 })
 
 // ── Display mode ──
+chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
+  if (!tabs[0]?.id) return
+  chrome.tabs.sendMessage(tabs[0].id, { type: 'subtitle:displayModeQuery' }, response => {
+    if (chrome.runtime.lastError || !response?.mode) return
+    displayMode = response.mode
+    renderCaptions()
+    const radio = document.querySelector(`input[name="display"][value="${response.mode}"]`) as HTMLInputElement | null
+    if (radio) radio.checked = true
+  })
+})
+
 document.querySelectorAll('input[name="display"]').forEach(radio => {
   radio.addEventListener('change', (e) => {
-    const mode = (e.target as HTMLInputElement).value
+    const mode = (e.target as HTMLInputElement).value as SubtitleDisplayMode
+    displayMode = mode
+    renderCaptions()
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       if (tabs[0]?.id) {
-        chrome.tabs.sendMessage(tabs[0].id, { type: 'subtitle:displayMode', data: { mode } })
+        chrome.tabs.sendMessage(tabs[0].id, { type: 'subtitle:displayMode', data: { mode } }).catch(() => {})
       }
     })
   })
@@ -161,10 +219,20 @@ document.querySelectorAll('input[name="display"]').forEach(radio => {
 
 // ── Message listener ──
 chrome.runtime.onMessage.addListener((msg: any) => {
+  if (msg.type === 'caption:update') updateCaption(msg.data.cue)
+  if (msg.type === 'caption:clear') {
+    captions.clear()
+    renderCaptions()
+  }
   if (msg.type === 'session:state') {
     updateUI(stateLabels[msg.data.state] ?? msg.data.state, msg.data.detail)
   }
   if (msg.type === 'model:progress') {
+    if (!msg.data.file) {
+      totalBytesMap.clear()
+      updateModelUI('dot-loading', msg.data.status ?? '正在加载模型...', 0)
+      return
+    }
     const file = msg.data.file ?? msg.data.status ?? ''
     const loaded = msg.data.loaded ?? 0
     const total = msg.data.total ?? 0
@@ -173,12 +241,16 @@ chrome.runtime.onMessage.addListener((msg: any) => {
     }
     const pct = computeTotalProgress()
     const shortFile = file.split('/').pop() ?? ''
-    updateModelUI('dot-loading', `下载中: ${shortFile}`, pct)
+    updateModelUI('dot-loading', msg.data.status ?? `加载中: ${shortFile}`, pct)
   }
   if (msg.type === 'model:ready') {
-    modelReady = true
     totalBytesMap.clear()
-    updateModelUI('dot-ok', `${msg.data.modelId.split('/').pop()} 就绪`)
+    const compatibleLegacy = selectedDevice === 'webgpu' && msg.data.device === 'wasm' && msg.data.profile === 'q8'
+    if (msg.data.modelId === selectedModelId && (msg.data.device === selectedDevice || compatibleLegacy)) {
+      updateModelUI('dot-ok', `${msg.data.modelId.split('/').pop()} / ${msg.data.profileLabel} / ${msg.data.device.toUpperCase()} 已加载`)
+    } else {
+      checkModelCached()
+    }
   }
   if (msg.type === 'model:error') {
     updateModelUI('dot-error', '模型加载失败')

@@ -103,6 +103,17 @@
     }
     .display-row input[type="radio"] { margin: 0; }
 
+    .caption-panel {
+      margin: 0 14px 14px; min-height: 160px; height: calc(100vh - 340px); max-height: 420px;
+      border: 1px solid #e0e3eb; border-radius: 8px; background: #fafbfe;
+      overflow-y: auto; padding: 10px;
+    }
+    .caption-empty { color: #8a90a5; text-align: center; padding: 28px 8px; font-size: 12px; }
+    .caption-item { padding: 8px 2px; border-bottom: 1px solid #e8ebf2; }
+    .caption-item:last-child { border-bottom: none; }
+    .caption-original { color: #5b6279; font-size: 12px; line-height: 1.45; }
+    .caption-translation { color: #1a1e2e; font-size: 14px; line-height: 1.5; margin-top: 3px; }
+
     .sep { height: 1px; background: #eef0f5; margin: 0 14px; }
   </style>
 </head>
@@ -164,6 +175,10 @@
         <label><input type="radio" name="display" value="original"> 原文</label>
       </div>
     </div>
+  </div>
+
+  <div class="caption-panel" id="caption-panel" aria-live="polite">
+    <div class="caption-empty" id="caption-empty">识别结果将在这里显示</div>
   </div>
 
   <script src="popup.js"></script>

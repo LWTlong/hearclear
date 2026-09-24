@@ -104,16 +104,17 @@
     <div class="field">
       <label>推理设备</label>
       <select id="asr-device">
-        <option value="webgpu">WebGPU（推荐）</option>
-        <option value="wasm">WASM（兼容模式）</option>
+        <option value="webgpu">WebGPU（推荐格式 FP32/Q4）</option>
+        <option value="wasm">WASM（Q8，CPU 兼容模式）</option>
       </select>
+      <div class="desc">WebGPU 优先使用官方示例的 FP32/Q4；现有 Q8 缓存仍可通过 WASM 兼容启动。切换设备后需下载对应格式，开始识别不会自动下载。</div>
     </div>
     <div id="model-list">
       <div class="model-row" data-model="onnx-community/whisper-tiny">
         <input type="radio" name="asr-model" value="onnx-community/whisper-tiny">
         <div class="name">
           <strong>whisper-tiny</strong>
-          <div class="desc">39M 参数 · ~75MB · 最快，英语够用</div>
+          <div class="desc">39M 参数 · 资源需求较低 · 下载大小取决于模型格式</div>
         </div>
         <span class="status status-none" id="status-tiny">检测中...</span>
       </div>
@@ -121,7 +122,7 @@
         <input type="radio" name="asr-model" value="onnx-community/whisper-small" checked>
         <div class="name">
           <strong>whisper-small</strong>
-          <div class="desc">244M 参数 · ~250MB · 推荐，英日韩可用</div>
+          <div class="desc">244M 参数 · WebGPU 主要权重约 586 MB · 速度需在本机实测</div>
         </div>
         <span class="status status-none" id="status-small">检测中...</span>
       </div>
@@ -129,9 +130,17 @@
         <input type="radio" name="asr-model" value="onnx-community/whisper-base">
         <div class="name">
           <strong>whisper-base</strong>
-          <div class="desc">74M 参数 · ~150MB · 轻量均衡</div>
+          <div class="desc">74M 参数 · 轻量模型 · 下载大小取决于模型格式</div>
         </div>
         <span class="status status-none" id="status-base">检测中...</span>
+      </div>
+      <div class="model-row" data-model="onnx-community/whisper-medium-ONNX">
+        <input type="radio" name="asr-model" value="onnx-community/whisper-medium-ONNX">
+        <div class="name">
+          <strong>whisper-medium</strong>
+          <div class="desc">769M 参数 · 内存与算力需求更高，加载和识别更慢</div>
+        </div>
+        <span class="status status-none" id="status-medium">检测中...</span>
       </div>
     </div>
     <div class="btn-row">

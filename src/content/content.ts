@@ -1,4 +1,5 @@
 import type { Cue, SubtitleDisplayMode, SubtitleStyle } from '../shared/types'
+import type { ContentMessage } from '../shared/messages'
 
 // ── State ──
 
@@ -11,6 +12,36 @@ let clearTimer: ReturnType<typeof setTimeout> | null = null
 let trackMonitorActive = false
 let monitoredTrack: TextTrack | null = null
 let translationCache = new Map<string, string>()
+let currentCueId: string | null = null
+const pageListeners = new AbortController()
+let mediaTimer: ReturnType<typeof setInterval> | null = null
+let videoObserver: MutationObserver | null = null
+
+function stopInvalidatedScript() {
+  pageListeners.abort()
+  if (mediaTimer) clearInterval(mediaTimer)
+  videoObserver?.disconnect()
+  stopTextTrackMonitor()
+  if (clearTimer) clearTimeout(clearTimer)
+  subtitleContainer?.remove()
+}
+
+async function sendPageMessage(msg: ContentMessage): Promise<void> {
+  if (pageListeners.signal.aborted) return
+  try {
+    if (!chrome.runtime.id) {
+      stopInvalidatedScript()
+      return
+    }
+    await chrome.runtime.sendMessage(msg)
+  } catch (err: any) {
+    if (!chrome.runtime.id || err.message?.includes('Extension context invalidated')) {
+      stopInvalidatedScript()
+    } else {
+      console.warn('[HearClear] Page message failed:', err)
+    }
+  }
+}
 
 // ── Video detection ──
 
@@ -32,7 +63,8 @@ function createSubtitleLayer(video: HTMLVideoElement) {
 
   const host = document.createElement('div')
   host.id = 'hearclear-subtitle-host'
-  host.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:2147483647;'
+  // KEEP: fixed positioning avoids player stacking/overflow rules; geometry follows the video below.
+  host.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483647;'
 
   shadowRoot = host.attachShadow({ mode: 'closed' })
   shadowRoot.innerHTML = `
@@ -84,27 +116,43 @@ function createSubtitleLayer(video: HTMLVideoElement) {
   `
 
   subtitleContainer = host
+  document.documentElement.appendChild(host)
+  updateSubtitleGeometry()
+}
 
-  const parent = video.parentElement
-  if (parent) {
-    if (getComputedStyle(parent).position === 'static') {
-      parent.style.position = 'relative'
-    }
-    parent.appendChild(host)
-  }
+function ensureSubtitleLayer() {
+  const activeVideo = findMainVideo()
+  if (!currentVideo?.isConnected || (activeVideo && activeVideo !== currentVideo)) currentVideo = activeVideo
+  if (!currentVideo) return
+  if (!subtitleContainer?.isConnected) createSubtitleLayer(currentVideo)
+  if (!subtitleContainer) return
+  const parent = document.fullscreenElement ?? document.documentElement
+  if (subtitleContainer.parentElement !== parent) parent.appendChild(subtitleContainer)
+}
+
+function updateSubtitleGeometry() {
+  if (!subtitleContainer || !currentVideo) return
+  const rect = currentVideo.getBoundingClientRect()
+  subtitleContainer.style.left = `${rect.left}px`
+  subtitleContainer.style.top = `${rect.top}px`
+  subtitleContainer.style.width = `${rect.width}px`
+  subtitleContainer.style.height = `${rect.height}px`
 }
 
 function showSubtitle(cue: Cue) {
-  if (!shadowRoot) return
+  ensureSubtitleLayer()
+  if (!shadowRoot || !subtitleContainer) return
+  updateSubtitleGeometry()
+  currentCueId = cue.id
   const orig = shadowRoot.getElementById('original')
   const trans = shadowRoot.getElementById('translation')
   if (orig) {
     orig.textContent = cue.original
-    orig.style.display = displayMode === 'translation' ? 'none' : ''
+    orig.style.display = displayMode === 'translation' && !!cue.translation ? 'none' : ''
   }
   if (trans) {
     trans.textContent = cue.translation ?? ''
-    trans.style.display = displayMode === 'original' ? 'none' : ''
+    trans.style.display = displayMode === 'original' || !cue.translation ? 'none' : ''
   }
 
   const container = shadowRoot.querySelector('.hc-subtitle') as HTMLElement
@@ -116,6 +164,7 @@ function showSubtitle(cue: Cue) {
 }
 
 function clearSubtitle() {
+  currentCueId = null
   if (!shadowRoot) return
   const orig = shadowRoot.getElementById('original')
   const trans = shadowRoot.getElementById('translation')
@@ -124,6 +173,16 @@ function clearSubtitle() {
 
   const container = shadowRoot.querySelector('.hc-subtitle') as HTMLElement
   if (container) container.style.opacity = '0'
+}
+
+function applyDisplayMode(mode: SubtitleDisplayMode) {
+  displayMode = mode
+  if (!shadowRoot) return
+  const orig = shadowRoot.getElementById('original')
+  const trans = shadowRoot.getElementById('translation')
+  const hasTranslation = !!trans?.textContent
+  if (orig) orig.style.display = mode === 'translation' && hasTranslation ? 'none' : ''
+  if (trans) trans.style.display = mode === 'original' || !hasTranslation ? 'none' : ''
 }
 
 function applyStyle(style: SubtitleStyle) {
@@ -143,24 +202,9 @@ function loadSavedStyle() {
 
 function handleFullscreenChange() {
   if (!subtitleContainer || !currentVideo) return
-  const fsEl = document.fullscreenElement
-  if (fsEl) {
-    // Move subtitle layer into the fullscreen container
-    if (fsEl.contains(currentVideo) || fsEl === currentVideo) {
-      if (fsEl !== currentVideo) {
-        if (getComputedStyle(fsEl).position === 'static') {
-          (fsEl as HTMLElement).style.position = 'relative'
-        }
-        fsEl.appendChild(subtitleContainer)
-      }
-    }
-  } else {
-    // Return to video parent
-    const parent = currentVideo.parentElement
-    if (parent && !parent.contains(subtitleContainer)) {
-      parent.appendChild(subtitleContainer)
-    }
-  }
+  const parent = document.fullscreenElement ?? document.documentElement
+  if (subtitleContainer.parentElement !== parent) parent.appendChild(subtitleContainer)
+  updateSubtitleGeometry()
 }
 
 // ── TextTrack monitoring ──
@@ -219,7 +263,7 @@ function startTextTrackMonitor() {
       }
     }
     if (batch.length > 0) {
-      chrome.runtime.sendMessage({ type: 'texttrack:batch', data: { cues: batch } }).catch(() => {})
+      sendPageMessage({ type: 'texttrack:batch', data: { cues: batch } })
     }
   }
 
@@ -260,38 +304,45 @@ function onCueChange() {
   showSubtitle(cue)
 
   if (!cached) {
-    chrome.runtime.sendMessage({
+    sendPageMessage({
       type: 'texttrack:cue',
       data: { id: cueId, startTime: activeCue.startTime, endTime: activeCue.endTime, text },
-    }).catch(() => {})
+    })
   }
 }
 
 // ── Media event listeners ──
 
 function attachMediaListeners(video: HTMLVideoElement) {
+  const options = { signal: pageListeners.signal }
+  window.addEventListener('scroll', updateSubtitleGeometry, { ...options, passive: true })
+  window.addEventListener('resize', updateSubtitleGeometry, options)
   video.addEventListener('play', () => {
-    chrome.runtime.sendMessage({ type: 'media:play' }).catch(() => {})
-  })
+    sendPageMessage({ type: 'media:play' })
+  }, options)
 
   video.addEventListener('pause', () => {
-    chrome.runtime.sendMessage({ type: 'media:pause' }).catch(() => {})
-  })
+    sendPageMessage({ type: 'media:pause' })
+  }, options)
 
   video.addEventListener('seeking', () => {
-    chrome.runtime.sendMessage({ type: 'media:seeking' }).catch(() => {})
-  })
+    sendPageMessage({ type: 'media:seeking' })
+  }, options)
 
   video.addEventListener('ratechange', () => {
-    chrome.runtime.sendMessage({
+    sendPageMessage({
       type: 'media:ratechange',
       data: { playbackRate: video.playbackRate },
-    }).catch(() => {})
-  })
+    })
+  }, options)
 
-  setInterval(() => {
+  mediaTimer = setInterval(() => {
+    if (!chrome.runtime.id) {
+      stopInvalidatedScript()
+      return
+    }
     if (!video.paused) {
-      chrome.runtime.sendMessage({
+      sendPageMessage({
         type: 'media:timeupdate',
         data: {
           currentTime: video.currentTime,
@@ -299,7 +350,7 @@ function attachMediaListeners(video: HTMLVideoElement) {
           paused: video.paused,
           playbackRate: video.playbackRate,
         },
-      }).catch(() => {})
+      })
     }
   }, 500)
 }
@@ -307,7 +358,7 @@ function attachMediaListeners(video: HTMLVideoElement) {
 // ── Detect ──
 
 function detectAndReport(video: HTMLVideoElement) {
-  chrome.runtime.sendMessage({
+  sendPageMessage({
     type: 'media:detected',
     data: {
       hasVideo: true,
@@ -315,7 +366,7 @@ function detectAndReport(video: HTMLVideoElement) {
       hasTextTrack: video.textTracks.length > 0,
       trackLangs: getTrackLangs(video),
     },
-  }).catch(() => {})
+  })
 }
 
 // ── Init ──
@@ -323,14 +374,18 @@ function detectAndReport(video: HTMLVideoElement) {
 function init() {
   const video = findMainVideo()
   if (!video) {
-    const observer = new MutationObserver(() => {
+    videoObserver = new MutationObserver(() => {
+      if (!chrome.runtime.id) {
+        stopInvalidatedScript()
+        return
+      }
       const v = findMainVideo()
       if (v) {
-        observer.disconnect()
+        videoObserver?.disconnect()
         setupVideo(v)
       }
     })
-    observer.observe(document.body, { childList: true, subtree: true })
+    videoObserver.observe(document.body, { childList: true, subtree: true })
     return
   }
   setupVideo(video)
@@ -345,9 +400,9 @@ function setupVideo(video: HTMLVideoElement) {
 
   video.textTracks.addEventListener('addtrack', () => {
     detectAndReport(video)
-  })
+  }, { signal: pageListeners.signal })
 
-  document.addEventListener('fullscreenchange', handleFullscreenChange)
+  document.addEventListener('fullscreenchange', handleFullscreenChange, { signal: pageListeners.signal })
 
   console.log('[HearClear] Video detected:', video.src || video.currentSrc || '(blob)')
 }
@@ -355,31 +410,51 @@ function setupVideo(video: HTMLVideoElement) {
 // ── Message handler ──
 
 chrome.runtime.onMessage.addListener((msg: any, _sender, sendResponse) => {
+  if (msg.type === 'session:state') {
+    if (msg.data.generation !== currentGeneration) clearSubtitle()
+    currentGeneration = msg.data.generation
+    if (msg.data.state === 'stopped' || msg.data.state === 'error') clearSubtitle()
+  }
   if (msg.type === 'subtitle:show') {
-    if (msg.data.generation === currentGeneration) {
-      showSubtitle(msg.data.cue)
-    }
+    const rendered = msg.data.generation === currentGeneration
+    if (rendered) showSubtitle(msg.data.cue)
+    console.info('[HearClear diagnostic]', JSON.stringify({
+      event: 'subtitle-render', generation: msg.data.generation, currentGeneration,
+      rendered, textLength: msg.data.cue.original?.length ?? 0,
+      hostConnected: subtitleContainer?.isConnected === true,
+      videoRect: currentVideo && (() => {
+        const rect = currentVideo.getBoundingClientRect()
+        return { left: rect.left, top: rect.top, width: rect.width, height: rect.height }
+      })(),
+    }))
+    sendResponse({ rendered })
+    return
   }
   if (msg.type === 'subtitle:clear') {
     currentGeneration = msg.data.generation
     clearSubtitle()
   }
   if (msg.type === 'subtitle:displayMode') {
-    displayMode = msg.data.mode
+    applyDisplayMode(msg.data.mode)
+    sendResponse({ ok: true })
+    return
+  }
+  if (msg.type === 'subtitle:displayModeQuery') {
+    sendResponse({ mode: displayMode })
+    return
   }
   if (msg.type === 'subtitle:style') {
     applyStyle(msg.data)
   }
   if (msg.type === 'subtitle:translated') {
     translationCache.set(msg.data.id, msg.data.translation)
-    // If the currently displayed cue matches, update it
-    if (shadowRoot) {
+    if (shadowRoot && currentCueId === msg.data.id) {
       const orig = shadowRoot.getElementById('original')
-      if (orig?.textContent === msg.data.id || translationCache.has(orig?.textContent ?? '')) {
-        const trans = shadowRoot.getElementById('translation')
-        if (trans && displayMode !== 'original') {
-          trans.textContent = translationCache.get(orig?.textContent ?? '') ?? msg.data.translation
-        }
+      const trans = shadowRoot.getElementById('translation')
+      if (orig) orig.style.display = displayMode === 'translation' ? 'none' : ''
+      if (trans && displayMode !== 'original') {
+        trans.textContent = msg.data.translation
+        trans.style.display = ''
       }
     }
   }
