@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      min-width: 300px;
+      max-width: 480px;
+      width: 100%;
+      font-family: -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+      font-size: 13px;
+      color: #1a1e2e;
+      background: #fff;
+    }
+
+    .header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 14px;
+      border-bottom: 1px solid #eef0f5;
+    }
+    .header h1 { font-size: 14px; font-weight: 700; letter-spacing: -0.01em; }
+    .header-actions { display: flex; gap: 6px; align-items: center; }
+    .header-actions a {
+      color: #5b6279; text-decoration: none; font-size: 11px; cursor: pointer;
+      padding: 3px 6px; border-radius: 4px; transition: background 0.12s;
+    }
+    .header-actions a:hover { background: #f0f2f7; }
+
+    /* ── Model status bar (prominent) ── */
+    .model-bar {
+      padding: 8px 14px;
+      background: #f8f9fc;
+      border-bottom: 1px solid #eef0f5;
+      font-size: 11px; color: #5b6279;
+      display: flex; align-items: center; gap: 6px;
+    }
+    .model-bar .dot {
+      width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
+    }
+    .dot-ok { background: #16a34a; }
+    .dot-loading { background: #f59e0b; animation: pulse 1s infinite; }
+    .dot-none { background: #d4d9e4; }
+    .dot-error { background: #dc2626; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+    .model-bar .progress-wrap {
+      flex: 1; height: 4px; background: #e8ecf3; border-radius: 2px; overflow: hidden;
+      display: none;
+    }
+    .model-bar .progress-wrap.show { display: block; }
+    .model-bar .progress-fill {
+      height: 100%; background: #2563eb; border-radius: 2px; transition: width 0.3s;
+    }
+    .model-bar .pct { font-variant-numeric: tabular-nums; min-width: 28px; text-align: right; }
+
+    /* ── Status + controls ── */
+    .status-section { padding: 12px 14px; }
+    .status-box {
+      background: #f4f5f9; border-radius: 8px; padding: 10px; text-align: center;
+      margin-bottom: 10px;
+    }
+    .status-text { font-size: 13px; font-weight: 600; color: #5b6279; }
+    .status-text.active { color: #16a34a; }
+    .status-text.error { color: #dc2626; }
+    .status-detail { font-size: 11px; color: #8a90a5; margin-top: 2px; }
+
+    .controls { display: flex; gap: 6px; }
+    .btn {
+      flex: 1; padding: 9px 0; border: none; border-radius: 6px;
+      font-size: 13px; font-weight: 600; cursor: pointer; transition: opacity 0.12s;
+      text-align: center;
+    }
+    .btn:hover { opacity: 0.85; }
+    .btn-primary { background: #2563eb; color: #fff; }
+    .btn-stop { background: #dc2626; color: #fff; }
+    .btn-mode {
+      flex: 0 0 auto; width: 80px; background: #f0f2f7; color: #1a1e2e;
+      padding: 9px 8px; font-size: 12px; appearance: none;
+      -webkit-appearance: none; border: none; border-radius: 6px;
+      cursor: pointer; text-align: center;
+    }
+
+    /* ── Config section ── */
+    .config { padding: 0 14px 12px; }
+    .config .row { margin-bottom: 8px; }
+    .config label {
+      display: block; font-size: 11px; font-weight: 600;
+      color: #8a90a5; margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.03em;
+    }
+    .config select {
+      width: 100%; padding: 7px 8px; border: 1px solid #e0e3eb; border-radius: 5px;
+      font-size: 12px; background: #fff; color: #1a1e2e;
+    }
+
+    .display-row {
+      display: flex; gap: 12px; align-items: center;
+    }
+    .display-row label {
+      display: flex; align-items: center; gap: 3px;
+      font-size: 12px; color: #1a1e2e; cursor: pointer;
+      white-space: nowrap; text-transform: none; letter-spacing: 0; font-weight: 400;
+      margin-bottom: 0;
+    }
+    .display-row input[type="radio"] { margin: 0; }
+
+    .sep { height: 1px; background: #eef0f5; margin: 0 14px; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>HearClear</h1>
+    <div class="header-actions">
+      <a id="btn-sidepanel" title="在侧边栏打开">侧栏</a>
+      <a id="settings-link">设置</a>
+    </div>
+  </div>
+
+  <div class="model-bar" id="model-bar">
+    <span class="dot dot-none" id="model-dot"></span>
+    <span id="model-text">模型未加载</span>
+    <div class="progress-wrap" id="model-progress-wrap">
+      <div class="progress-fill" id="model-progress-fill" style="width:0%"></div>
+    </div>
+    <span class="pct" id="model-pct" style="display:none"></span>
+  </div>
+
+  <div class="status-section">
+    <div class="status-box">
+      <div class="status-text" id="status">未启动</div>
+      <div class="status-detail" id="status-detail"></div>
+    </div>
+    <div class="controls">
+      <button class="btn btn-primary" id="btn-start">开始翻译</button>
+      <select class="btn-mode" id="work-mode">
+        <option value="auto">自动</option>
+        <option value="subtitle_only">仅字幕</option>
+        <option value="asr_only">强制识别</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="sep"></div>
+
+  <div class="config">
+    <div class="row">
+      <label>源语言</label>
+      <select id="src-lang">
+        <option value="en">English</option>
+        <option value="ja">日本語</option>
+        <option value="ko">한국어</option>
+      </select>
+    </div>
+    <div class="row">
+      <label>目标语言</label>
+      <select id="tgt-lang">
+        <option value="简体中文">简体中文</option>
+      </select>
+    </div>
+    <div class="row">
+      <label>显示</label>
+      <div class="display-row">
+        <label><input type="radio" name="display" value="bilingual" checked> 双语</label>
+        <label><input type="radio" name="display" value="translation"> 仅译文</label>
+        <label><input type="radio" name="display" value="original"> 原文</label>
+      </div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

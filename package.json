@@ -1,0 +1,20 @@
+{
+  "name": "hearclear",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:full": "node scripts/build.mjs --model",
+    "watch": "node scripts/build.mjs --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.6.0"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.3.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.0"
+  }
+}
